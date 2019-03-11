@@ -1,0 +1,78 @@
+name:                data-manip
+version:             0.1.0.0
+github:              "nick-chandoke/data-manip"
+license:             BSD3
+author:              "Nicholas Chandoke"
+maintainer:          "nicholas.chandoke@gmail.com"
+copyright:           "2019 Nicholas Chandoke"
+
+extra-source-files:
+- README.md
+- ChangeLog.md
+
+# Metadata used when publishing your package
+# synopsis:            Short description of your package
+# category:            Web
+
+# To avoid duplicated efforts in documentation and dealing with the
+# complications of embedding Haddock markup inside cabal files, it is
+# common to point users to the README.md file.
+description:         Please see the README on GitHub at <https://github.com/nick-chandoke/data-manip#readme>
+
+dependencies:
+- base >= 4.7 && < 5
+- NicLib
+- containers
+- hxt
+- text
+- cmark-gfm
+- lucid
+- transformers
+
+library:
+  source-dirs: src
+
+tests:
+  data-manip-test:
+    main:                Spec.hs
+    source-dirs:         test
+    ghc-options:
+    - -threaded
+    - -rtsopts
+    - -with-rtsopts=-N
+    dependencies:
+    - data-manip
+
+default-extensions:
+- ApplicativeDo
+- Arrows
+- DataKinds
+- DefaultSignatures
+- DeriveDataTypeable
+- DeriveFunctor
+- DeriveGeneric
+- FlexibleContexts
+- FlexibleInstances
+- GADTs
+- GeneralizedNewtypeDeriving
+- LambdaCase
+- MonadComprehensions
+- MultiParamTypeClasses
+- MultiWayIf
+- NamedFieldPuns
+- NoMonomorphismRestriction
+- NumDecimals
+- OverloadedLists
+- OverloadedStrings
+- ParallelListComp
+- RankNTypes
+- RecordWildCards
+- ScopedTypeVariables
+- StandaloneDeriving
+- TupleSections
+- TypeApplications
+- TypeFamilies
+- TypeOperators
+- TypeSynonymInstances
+- UndecidableInstances
+- ViewPatterns
