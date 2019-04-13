@@ -1,3 +1,0 @@
-# data-manip
-
-Any functions that manipulate data: maps, filters, conversions,....

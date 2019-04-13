@@ -6,27 +6,20 @@ author:              "Nicholas Chandoke"
 maintainer:          "nicholas.chandoke@gmail.com"
 copyright:           "2019 Nicholas Chandoke"
 
-extra-source-files:
-- README.md
-- ChangeLog.md
+extra-source-files: []
 
-# Metadata used when publishing your package
-# synopsis:            Short description of your package
-# category:            Web
-
-# To avoid duplicated efforts in documentation and dealing with the
-# complications of embedding Haddock markup inside cabal files, it is
-# common to point users to the README.md file.
 description:         Please see the README on GitHub at <https://github.com/nick-chandoke/data-manip#readme>
 
 dependencies:
-- base >= 4.7 && < 5
 - NicLib
+- attoparsec
+- base >= 4.7 && < 5
+# - cmark-gfm
 - containers
 - hxt
-- text
-- cmark-gfm
 - lucid
+- rio
+- text
 - transformers
 
 library:
@@ -46,6 +39,7 @@ tests:
 default-extensions:
 - ApplicativeDo
 - Arrows
+- BangPatterns
 - DataKinds
 - DefaultSignatures
 - DeriveDataTypeable
@@ -60,6 +54,7 @@ default-extensions:
 - MultiParamTypeClasses
 - MultiWayIf
 - NamedFieldPuns
+- NoImplicitPrelude
 - NoMonomorphismRestriction
 - NumDecimals
 - OverloadedLists
