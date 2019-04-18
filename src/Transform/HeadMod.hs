@@ -36,7 +36,7 @@
 --
 -- * this library uses /strict/ 'StateT'!
 -- * throughout the library you'll see the symbol @conv@; this refers to either @toHtml@ or @toHtmlRaw@.
-module Manip.HeadMod
+module Transform.HeadMod
 ( -- * HeadModT
   Element(..)
 , Head

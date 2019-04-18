@@ -1,5 +1,5 @@
 -- | DOM manipulations
-module Manip.HTML
+module Transform.HTML
 ( lineCode
 , deriveTOC
 , giveIdsToHeadings
