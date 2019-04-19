@@ -6,15 +6,15 @@
 -- let input :: Text
 --     input = "just text [hi|this input will be ignored|] and [upper|this input will be uppercase'd|]"
 
---     macroMap :: Applicative m =\> Map Text (Text -\> Transform m Utf8Builder)
+--     macroMap :: Applicative m =\> Map Text (Text -\> Transform m Utf8Builder ())
 --     macroMap = [ ("hi", \\_ send _ -\> send "hi")
 --                , ("upper", \\arg send flush -\> send (display $ T.toUpper arg) *\> flush)
 --                ]
 
---     onMissingMacro :: Monad m =\> Text -\> Text -\> Transform m Utf8Builder
+--     onMissingMacro :: Monad m =\> Text -\> Text -\> Transform m Utf8Builder ()
 --     onMissingMacro macroName remainder = \\send flush -\> send ("invalid macro: " \<\> display macroName) *\> flush *\> buildTransform onMissingMacro macroMap remainder send flush
 
---     transform :: Monad m =\> Transform m Utf8Builder
+--     transform :: Monad m =\> Transform m Utf8Builder ()
 --     transform = buildTransform onMissingMacro macroMap input
 -- @
 -- >>> utf8BuilderToText . runIdentity . runTransform $ transform
@@ -24,59 +24,75 @@
 --
 -- @runTransform@ sets @flush@ to a no-op, so flush does nothing in this example. That being said, if @transform@ were used as a @StreamingBody@ in a server setting, then flush would matter!
 --
+-- === Design: CPS vs. Objects, @StreamingBody@ vs. @Conduit@
+--
+-- Normally you'd work with 0-morphisms (objects), then pass them to @responseStream@ or @writeFile@ or something. I chose to design functions around @StreamingBody@-style 2-morphism continuations solely to give the option of flushing macros after they're done computing, which may be useful for text steams with multiple macros that each require large amounts of memory or time to compute. In other words: this module is mostly useless if you're using only macros that execute quickly and have little output!
+--
+-- If you're thinking "that sounds like Conduit! Why not just use Conduit?", then we're on the same page! I'm not using Conduit because WAI no longer uses Conduit; it uses @StreamingBody@ now, and this module was made to consistently write text to file and responses to socket. Should be isomorphic with Conduit. This module may work with Conduit in a later version.
+--
 -- === Efficiency Note
 --
 -- As I mention in the blog post, there're no downsides to using @Transform@ compared to @(Utf8)Builder@. This assumes that you're using flush judiciously! If you're unsure, then it's probably better to use it less often than more often. (Maybe it'd be nice to have a monad that auto-flushes when buffer reaches a given size?)
 module Transform where
 
-import RIO
-import RIO.Text (Text)
-import qualified RIO.Text as T
-import RIO.Map (Map)
-import qualified RIO.Map as M
 import Control.Monad.Trans.Writer.Strict
 import Data.Attoparsec.Text
+import Data.Bifunctor (Bifunctor)
+import RIO
+import RIO.Map (Map)
+import RIO.Text (Text)
+import qualified Data.Bifunctor as BiF
+import qualified RIO.Map as M
+import qualified RIO.Text as T
 
--- | Parses an input string and returns an output string in an Applicative. The first argument is a /send/ function, and the second a /flush/ one. A generalization of @StreamingBody@ which allows writing a streaming server route at the same time as a text transformer. This lessens work needed to keep dynamically and statically-served web routes consistent.
+-- | Parses an input string and writes it to a buffer, flushing as desired. The first argument is a /send/ function, and the second a /flush/ one. @Transform@ is a generalization of @StreamingBody@ that obviously reifies to @StreamingBody@, but also to Text, which can be written to a file or file handle. This makes writing consistent dynamic and static web routes simple.
 --
 -- For responses that may fail/need validation, use @Either@. For example, giving an HTTP 500 Internal Server Error page (using some tongue-in-cheek objects of the @req@ package and lens):
 --
 -- @
--- someTrans :: (Status, Transform IO Utf8Builder)
--- someTrans = Transform $ \send flush -> ((status500,) ||| (ok200,)) <=< runExceptT $ do
---     md <- handle (throwM . to500Resp) . liftIO $ readFile "thing.md"
---     pure . display $ commonmarkToHtml [] md
+-- someTrans :: IO (Status, Transform IO Utf8Builder ())
+-- someTrans = ((status500,) ||| (status200,))
+--           . both (\builder -> Transform $ \send flush -> send builder *> flush)
+--          <$> runExceptT loadMarkup
 --   where
---     to500Resp :: IOException -> Utf8Builder
---     to500Resp e = "Could not read markdown source file: " <> display e
+--     loadMarkup :: ExceptT Utf8Builder IO Utf8Builder
+--     loadMarkup = do
+--         md <- ExceptT $ handle
+--             (\(e :: IOException) -> pure . Left $ "Could not read markdown source file: " <> display e)
+--             (Right . display <$> readFileUtf8 "")
+--         pure . display $ commonmarkToHtml [] md
 --
--- case someTrans responseStream toStreamingBody
+-- someTrans >>= \(status, trans) -> responseStream status [] (toStreamingBody trans)
 -- @
 --
 -- The last line of the monad should be @flush@ or @pure ()@.
-newtype Transform f s = Transform { getTrans :: (s -> f ()) -> f () -> f () } deriving Functor -- alternatively I could return an s, then pass that to s merely inside. Really all I need is an s; I can supply the flush and 
+newtype Transform f i o = Transform { getTrans :: (i -> f ()) -> f () -> f o }
+
+instance Functor f => Bifunctor (Transform f) where
+    first f (Transform t) = Transform $ \send flush -> t (send . f) flush
+    second f (Transform t) = Transform $ \send flush -> f <$> t send flush
 
 -- | Create a @Transform@ that sequences two transforms. Essentially a wrapper around @*>@
-instance Applicative f => Semigroup (Transform f t) where
+instance (Semigroup o, Applicative f) => Semigroup (Transform f t o) where
     Transform f <> Transform g = Transform $ \send flush -> f send flush *> g send flush
 
 -- | Run a @Transform@ on text. You can convert the output to Text via 'utf8BuilderToText'.
-runTransform :: (Monad m, w ~ Utf8Builder) => Transform (WriterT w m) w -> m w
+runTransform :: (Monad m, w ~ Utf8Builder) => Transform (WriterT w m) w () -> m w
 runTransform (Transform t) = fmap snd . runWriterT $ t tell (pure ())
 
 -- | Output text to an IO 'Handle', as you would a @StreamingBody@.
-runTransformHandle :: MonadIO m => Handle -> Transform m Utf8Builder -> m ()
+runTransformHandle :: MonadIO m => Handle -> Transform m Utf8Builder () -> m ()
 runTransformHandle h (Transform t) = t (hPutBuilder h . getUtf8Builder) (hFlush h)
 
-toStreamingBody :: Transform IO Utf8Builder -> (Builder -> IO ()) -> IO () -> IO ()
-toStreamingBody = getTrans . fmap getUtf8Builder
+toStreamingBody :: Transform IO Utf8Builder () -> (Builder -> IO ()) -> IO () -> IO ()
+toStreamingBody = getTrans . BiF.first getUtf8Builder
 
 -- | Create a transform that merely sends a value and *does not flush it*. This would be the implementation of @pure@ if @Transform@ were an @Applicative@, which it isn't because @liftA2@ cannot be defined (though I haven't proven this, and I'd like to identify exactly /why/ it cannot be done.)
-pureTrans :: Applicative f => s -> Transform f s
+pureTrans :: Applicative f => s -> Transform f s ()
 pureTrans x = Transform $ \send _ -> send x
 
 -- | Computes a @Transform@ completely or until short-circuiting. If failure, the returned @Transform@ is already complete and includes a call to flush.
-withError :: ExceptT e IO Utf8Builder -> 
+-- withError :: ExceptT e IO Utf8Builder -> 
 
 -- | Create a Transform from macros in a body of text. The macro format is QuasiQuotation-like: @[macroName|input|]@. This will pass @input@ to the @macroName@ macro, then replace the whole quasi-quote block with its output.
 --
@@ -84,7 +100,7 @@ withError :: ExceptT e IO Utf8Builder ->
 --
 -- *Note*: @buildTransform@ does not flush after performing macro substitutions; that is the responlibility of each macro itself. Only macros that give a signaficant amount of output should flush.
 buildTransform :: forall m trans
-                . (Monad m, trans ~ Transform m Utf8Builder)
+                . (Monad m, trans ~ Transform m Utf8Builder ())
                => (Text -> Text -> trans) -- ^ how to handle macros not being found. Arguments are macro name, then text following macro clause
                -> Map Text (Text -> trans) -- ^ macro identifiers and their corresponding functions to apply to their inputs
                -> Text -- ^ input text
