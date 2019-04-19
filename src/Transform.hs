@@ -1,22 +1,7 @@
--- | Utilities for applying string endomorphisms (or /transforms/) within parts of text documents. Two cases are supported: 1) text to text; and 2) text to @StreamingBody@ (see <http://hackage.haskell.org/package/wai-3.2.2/docs/Network-Wai.html#v:responseStream the wai package>. See <https://nicholaschandoke.me/articles/how-to-host-content How to Host Content>.
+-- | Utilities for applying string endomorphisms (or /transforms/) within parts of text documents, outputting as a stream.
 --
--- === Example
+-- See accompanying blog post, [How to Host Content](https://nicholaschandoke.me/articles/how-to-host-content).
 --
--- @
--- let input :: Text
---     input = "just text [hi|this input will be ignored|] and [upper|this input will be uppercase'd|]"
-
---     macroMap :: Applicative m =\> Map Text (Text -\> Transform m Utf8Builder ())
---     macroMap = [ ("hi", \\_ send _ -\> send "hi")
---                , ("upper", \\arg send flush -\> send (display $ T.toUpper arg) *\> flush)
---                ]
-
---     onMissingMacro :: Monad m =\> Text -\> Text -\> Transform m Utf8Builder ()
---     onMissingMacro macroName remainder = \\send flush -\> send ("invalid macro: " \<\> display macroName) *\> flush *\> buildTransform onMissingMacro macroMap remainder send flush
-
---     transform :: Monad m =\> Transform m Utf8Builder ()
---     transform = buildTransform onMissingMacro macroMap input
--- @
 -- >>> utf8BuilderToText . runIdentity . runTransform $ transform
 -- "just text hi and THIS INPUT WILL BE UPPERCASE'D"
 --
@@ -33,11 +18,24 @@
 -- === Efficiency Note
 --
 -- As I mention in the blog post, there're no downsides to using @Transform@ compared to @(Utf8)Builder@. This assumes that you're using flush judiciously! If you're unsure, then it's probably better to use it less often than more often. (Maybe it'd be nice to have a monad that auto-flushes when buffer reaches a given size?)
-module Transform where
+module Transform
+( Transform(..)
+, runTransform
+, runTransformHandle
+, toStreamingBody
+, pureTrans
+, withError
+, buildTransform
+, handleExcept
+-- , footnotes
+) where
 
+import Control.Arrow ((|||))
+import Control.Monad.Trans.Except
 import Control.Monad.Trans.Writer.Strict
 import Data.Attoparsec.Text
 import Data.Bifunctor (Bifunctor)
+import NicLib.NStdLib (both)
 import RIO
 import RIO.Map (Map)
 import RIO.Text (Text)
@@ -45,27 +43,27 @@ import qualified Data.Bifunctor as BiF
 import qualified RIO.Map as M
 import qualified RIO.Text as T
 
--- | Parses an input string and writes it to a buffer, flushing as desired. The first argument is a /send/ function, and the second a /flush/ one. @Transform@ is a generalization of @StreamingBody@ that obviously reifies to @StreamingBody@, but also to Text, which can be written to a file or file handle. This makes writing consistent dynamic and static web routes simple.
+-- | Parses an input string and writes it to a buffer, flushing as desired. The first argument is a /send/ function, and the second a /flush/ one. @Transform@ is a generalization of @StreamingBody@ that obviously reifies to @StreamingBody@, but also to @Text@, which can be written to a file. This makes writing consistent dynamic and static web routes simple.
 --
--- For responses that may fail/need validation, use @Either@. For example, giving an HTTP 500 Internal Server Error page (using some tongue-in-cheek objects of the @req@ package and lens):
+-- For responses that may fail/need validation, use @Either@. For example, giving an HTTP 500 Internal Server Error page:
 --
 -- @
 -- someTrans :: IO (Status, Transform IO Utf8Builder ())
 -- someTrans = ((status500,) ||| (status200,))
---           . both (\builder -> Transform $ \send flush -> send builder *> flush)
---          <$> runExceptT loadMarkup
+--           . both (\\builder -\> Transform $ \\send flush -\> send builder *\> flush)
+--          \<$\> runExceptT loadMarkup
 --   where
 --     loadMarkup :: ExceptT Utf8Builder IO Utf8Builder
 --     loadMarkup = do
---         md <- ExceptT $ handle
---             (\(e :: IOException) -> pure . Left $ "Could not read markdown source file: " <> display e)
---             (Right . display <$> readFileUtf8 "")
+--         md \<- ExceptT $ handle
+--             (\\(e :: IOException) -\> pure . Left $ "Could not read markdown source file: " \<\> display e)
+--             (Right . display \<$\> readFileUtf8 "thing.md")
 --         pure . display $ commonmarkToHtml [] md
---
--- someTrans >>= \(status, trans) -> responseStream status [] (toStreamingBody trans)
+-- 
+-- someTrans \>\>= \\(status, trans) -\> responseStream status [] (toStreamingBody trans)
 -- @
 --
--- The last line of the monad should be @flush@ or @pure ()@.
+-- @commonmarkToHtml@ is from the @cmark-gfm@ package, btw.
 newtype Transform f i o = Transform { getTrans :: (i -> f ()) -> f () -> f o }
 
 instance Functor f => Bifunctor (Transform f) where
@@ -84,6 +82,7 @@ runTransform (Transform t) = fmap snd . runWriterT $ t tell (pure ())
 runTransformHandle :: MonadIO m => Handle -> Transform m Utf8Builder () -> m ()
 runTransformHandle h (Transform t) = t (hPutBuilder h . getUtf8Builder) (hFlush h)
 
+-- | For pass to @responseStream@ in the @wai@ package
 toStreamingBody :: Transform IO Utf8Builder () -> (Builder -> IO ()) -> IO () -> IO ()
 toStreamingBody = getTrans . BiF.first getUtf8Builder
 
@@ -91,14 +90,47 @@ toStreamingBody = getTrans . BiF.first getUtf8Builder
 pureTrans :: Applicative f => s -> Transform f s ()
 pureTrans x = Transform $ \send _ -> send x
 
--- | Computes a @Transform@ completely or until short-circuiting. If failure, the returned @Transform@ is already complete and includes a call to flush.
--- withError :: ExceptT e IO Utf8Builder -> 
+-- | Convenience functional made HTTP responses that may fail. Here's the definition of @someTrans@ from the error handling example in 'Transform''s documentation, in terms of @withError@ and 'handleExcept':
+--
+-- @
+-- someTrans = withError (status500,) (status200,)
+--           $ display . commonmarkToHtml []
+--          \<$\> handleExcept (\\(e :: IOException) -\> "Could not read markdown source file: " \<\> display e) (display \<$\> readFileUtf8 "thing.md")
+-- @
+withError :: Applicative f
+          => (Transform f i () -> b) -- ^ on failed execution of transform
+          -> (Transform f i () -> b) -- ^ on successful execution of transform
+          -> ExceptT i f i -- route that supports failure
+          -> f b
+withError onBad onGood = fmap ((onBad ||| onGood) . both (\x -> Transform $ \send flush -> send x *> flush)) . runExceptT
+
+-- | Lifts a call to @handle@ to @ExceptT@. See example in 'withError' documentation.
+handleExcept :: (MonadUnliftIO m, Exception e) => (e -> m a) -> m b -> ExceptT a m b
+handleExcept h r = ExceptT $ handle (fmap Left . h) (Right <$> r)
 
 -- | Create a Transform from macros in a body of text. The macro format is QuasiQuotation-like: @[macroName|input|]@. This will pass @input@ to the @macroName@ macro, then replace the whole quasi-quote block with its output.
 --
 -- * Preface the first '[' with a backslash to leave as a literal.
 --
 -- *Note*: @buildTransform@ does not flush after performing macro substitutions; that is the responlibility of each macro itself. Only macros that give a signaficant amount of output should flush.
+--
+-- === Example
+--
+-- @
+-- let input :: Text
+--     input = "just text [hi|this input will be ignored|] and [upper|this input will be uppercase'd|]"
+--
+--     macroMap :: Applicative m =\> Map Text (Text -\> Transform m Utf8Builder ())
+--     macroMap = [ ("hi", \\_ send _ -\> send "hi")
+--                , ("upper", \\arg send flush -\> send (display $ T.toUpper arg) *\> flush)
+--                ]
+--
+--     onMissingMacro :: Monad m =\> Text -\> Text -\> Transform m Utf8Builder ()
+--     onMissingMacro macroName remainder = \\send flush -\> send ("invalid macro: " \<\> display macroName) *\> flush *\> buildTransform onMissingMacro macroMap remainder send flush
+--
+--     transform :: Monad m =\> Transform m Utf8Builder ()
+--     transform = buildTransform onMissingMacro macroMap input
+-- @
 buildTransform :: forall m trans
                 . (Monad m, trans ~ Transform m Utf8Builder ())
                => (Text -> Text -> trans) -- ^ how to handle macros not being found. Arguments are macro name, then text following macro clause
@@ -126,8 +158,8 @@ buildTransform handleNoMacro !m = go
             next
             input <- manyTill' anyChar "|]" -- surprised there's no provided more efficient Text-specific version
             pure (name, T.pack input)
-{-
--- | Create links to footnotes for of the form:
+
+{- | Create links to footnotes for of the form:
 --
 -- @
 -- Ordinary document like any other(1). Just *some(2) stuff*.
