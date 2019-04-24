@@ -1,112 +1,172 @@
--- | Utilities for applying string endomorphisms (or /transforms/) within parts of text documents, outputting as a stream.
+-- TODO: update examples
+-- | Transforming streams that output purely, to file handle, or HTTP streaming response. See accompanying blog post, [How to Host Content](https://nicholaschandoke.me/articles/how-to-host-content). The goal is to be able to write a web route that can be written to a file or streamed.
 --
--- See accompanying blog post, [How to Host Content](https://nicholaschandoke.me/articles/how-to-host-content).
+-- === Design
 --
--- >>> utf8BuilderToText . runIdentity . runTransform $ transform
--- "just text hi and THIS INPUT WILL BE UPPERCASE'D"
+-- * __Q__: Why output streams rather than Objects? __A__: it enables short-circuiting and flushing early, so that we can stream data as it becomes available, for macros that take time or memory to compute.
+-- * __Q__: why @StreamingBody@ instead of @Conduit@? __A__: Because wai uses it. It used to use @Conduit@. They're basically isomorphic. The only obvious difference is that, though @Conduit@ isn't strictly related to @ResourceT@, they often go together, but afaik there're no @ResourceT@ functions for the  @Transform@ pattern. Still, at least one can wrap a @Transform@ in @bracket@.
 --
--- If we change the "hi" macro in input to "ho", which is not in the macro map, then we get the result "just text invalid macro: ho and THIS INPUT WILL BE UPPERCASE'D"
+-- If you're using only macros that execute quickly and have little output, then you don't benefit from streaming. That being said, you don't /lose/ anything, either. In the interest of making a unified API, I've created 'pureTrans' for that purpose. That way you can use streams without using streams ;p
 --
--- @runTransform@ sets @flush@ to a no-op, so flush does nothing in this example. That being said, if @transform@ were used as a @StreamingBody@ in a server setting, then flush would matter!
---
--- === Design: CPS vs. Objects, @StreamingBody@ vs. @Conduit@
---
--- Normally you'd work with 0-morphisms (objects), then pass them to @responseStream@ or @writeFile@ or something. I chose to design functions around @StreamingBody@-style 2-morphism continuations solely to give the option of flushing macros after they're done computing, which may be useful for text steams with multiple macros that each require large amounts of memory or time to compute. In other words: this module is mostly useless if you're using only macros that execute quickly and have little output!
---
--- If you're thinking "that sounds like Conduit! Why not just use Conduit?", then we're on the same page! I'm not using Conduit because WAI no longer uses Conduit; it uses @StreamingBody@ now, and this module was made to consistently write text to file and responses to socket. Should be isomorphic with Conduit. This module may work with Conduit in a later version.
+-- This module uses @MonadChronicle@, which generalizes @ExceptT@ and 'ChronicleT'. @ChronicleT@ was considered in anticipation for possible future proofreading utilities that should support accumulating errors at authoring time, and shorting errors at execution time. Polymorphism is retained with recognition that many routes will fail without accumulating errors, and thus are more appropriately (or easily) written in terms of @ExceptT@. Remember that we have 'liftExcept' and 'memento' to convert between the two.
 --
 -- === Efficiency Note
 --
--- As I mention in the blog post, there're no downsides to using @Transform@ compared to @(Utf8)Builder@. This assumes that you're using flush judiciously! If you're unsure, then it's probably better to use it less often than more often. (Maybe it'd be nice to have a monad that auto-flushes when buffer reaches a given size?)
+-- As I mention in the blog post, there're no downsides to using @Transform@ compared to @(Utf8)Builder@. This assumes that you're using flush judiciously! If you're unsure, then it's probably better to use it less often than more often. (Maybe it'd be nice to have a monad transformer that auto-flushes when buffer reaches a given size?)
+--
+-- == Examples
+--
+-- The types that I give are monomorphic examples of actually polymorphic signatures.
+--
+-- === Pure
+--
+-- @
+-- runTransformPure (send id   *> pure 3) "hello!" :: WriterT Text IO Int
+-- runTransformPure (send lift *> pure 3) "hello!" :: ChronicleT [Text] (Writer Text) Int
+-- @
+--
+-- === I/O
+--
+-- @
+-- 'toStreamingBodyUtf8'
+-- @
+--
+-- Check-out 'macros' for more examples.
 module Transform
-( Transform(..)
-, runTransform
+( -- * Basic Types
+  Transform(..)
+, strmap
+, transLift
+, NatTrans
+, mmap
+-- * Basic Arrows
+, send
+, flush
+, sendAndFlush
+, withInput
+-- * Execution
 , runTransformHandle
+, toStreamingBodyUtf8
 , toStreamingBody
-, pureTrans
-, withError
-, buildTransform
+, runTransformPure
+-- * Parse Arrow
+, macros
+-- * Error Handling
 , handleExcept
--- , footnotes
+, liftExcept
+-- * Specific Transforms
+--, footnotes
 ) where
 
-import Control.Arrow ((|||))
+import Control.Arrow
+import Control.Category
+import Control.Monad.Trans.Chronicle
+import Control.Monad.Trans.Chronicle
 import Control.Monad.Trans.Except
 import Control.Monad.Trans.Writer.Strict
 import Data.Attoparsec.Text
-import Data.Bifunctor (Bifunctor)
-import NicLib.NStdLib (both)
-import RIO
+import Data.Bitraversable
+import Data.Semigroup (Last(..))
+import Data.These
+import Data.These
+import NicLib.NStdLib (maybeC)
+import RIO hiding ((.), id)
 import RIO.Map (Map)
 import RIO.Text (Text)
-import qualified Data.Bifunctor as BiF
 import qualified RIO.Map as M
 import qualified RIO.Text as T
 
--- | Parses an input string and writes it to a buffer, flushing as desired. The first argument is a /send/ function, and the second a /flush/ one. @Transform@ is a generalization of @StreamingBody@ that obviously reifies to @StreamingBody@, but also to @Text@, which can be written to a file. This makes writing consistent dynamic and static web routes simple.
---
--- For responses that may fail/need validation, use @Either@. For example, giving an HTTP 500 Internal Server Error page:
---
--- @
--- someTrans :: IO (Status, Transform IO Utf8Builder ())
--- someTrans = ((status500,) ||| (status200,))
---           . both (\\builder -\> Transform $ \\send flush -\> send builder *\> flush)
---          \<$\> runExceptT loadMarkup
---   where
---     loadMarkup :: ExceptT Utf8Builder IO Utf8Builder
---     loadMarkup = do
---         md \<- ExceptT $ handle
---             (\\(e :: IOException) -\> pure . Left $ "Could not read markdown source file: " \<\> display e)
---             (Right . display \<$\> readFileUtf8 "thing.md")
---         pure . display $ commonmarkToHtml [] md
--- 
--- someTrans \>\>= \\(status, trans) -\> responseStream status [] (toStreamingBody trans)
--- @
---
--- @commonmarkToHtml@ is from the @cmark-gfm@ package, btw.
-newtype Transform f i o = Transform { getTrans :: (i -> f ()) -> f () -> f o }
+-- | Natural transformtion. Unrelated to @Transform@.
+type NatTrans n m = forall a. n a -> m a
 
-instance Functor f => Bifunctor (Transform f) where
-    first f (Transform t) = Transform $ \send flush -> t (send . f) flush
-    second f (Transform t) = Transform $ \send flush -> f <$> t send flush
+-- | "Monad map." I couldn't think of a better name for a general 2-morphism.
+--
+-- ex. @mmap runChronicleT :: Transform n (ChronicleT c d) s i a -> Transform n d s i (These c a)@
+mmap :: (c a -> d b) -> Transform n c s i a -> Transform n d s i b
+mmap n t = Transform $ \s fl i -> n (runTrans t s fl i)
 
--- | Create a @Transform@ that sequences two transforms. Essentially a wrapper around @*>@
-instance (Semigroup o, Applicative f) => Semigroup (Transform f t o) where
-    Transform f <> Transform g = Transform $ \send flush -> f send flush *> g send flush
+-- Nearly isomorphic to ReaderT (s -> n (), n ()) m a: Transform encapsulates its input, so we can map over it, whereas ReaderT does not.
+-- | Category equipped with two functions: one to send/write a string, and one to flush the buffer that it's been written to. The send & flush monad differs from the codomain to accomodate monad transformers for which @lift@ is a monomorphism. It seems that any natural transformation from @n@ to @m@ should be monic. Using two monads is necessary to flush to IO (/e.g./ the case of @StreamingBody@) while still collecting errors or having other effects usually employed by monad transformers.
+newtype Transform n m s a b = Transform { runTrans :: (s -> n ()) -> n () -> a -> m b } deriving Functor -- m b rather than b because calling send or flush mandates returning in a monad
 
--- | Run a @Transform@ on text. You can convert the output to Text via 'utf8BuilderToText'.
-runTransform :: (Monad m, w ~ Utf8Builder) => Transform (WriterT w m) w () -> m w
-runTransform (Transform t) = fmap snd . runWriterT $ t tell (pure ())
+instance Monad m => Category (Transform n m s) where
+    id = Transform $ \_ _ -> pure
+    Transform g . Transform f = Transform $ \s fl i -> f s fl i >>= g s fl
+
+instance Monad m => Arrow (Transform n m s) where
+    arr m = Transform $ \_ _ -> pure . m
+    first  (Transform t) = Transform $ \s fl (b, d) -> (,d) <$> t s fl b
+    second (Transform t) = Transform $ \s fl (b, d) -> (b,) <$> t s fl d
+    Transform g *** Transform f = Transform $ \s fl (b, b') -> liftA2 (,) (g s fl b) (f s fl b')
+    Transform g &&& Transform f = Transform $ \s fl b -> liftA2 (,) (g s fl b) (f s fl b)
+
+instance Monad m => ArrowChoice (Transform n m s) where
+    left (Transform t) = Transform $ \s fl -> bitraverse (t s fl) pure
+    right (Transform t) = Transform $ \s fl -> bitraverse pure (t s fl)
+    Transform g +++ Transform f = Transform $ \s fl -> bitraverse (g s fl) (f s fl)
+    Transform g ||| Transform f = Transform $ \s fl -> g s fl ||| f s fl
+
+instance Monad m => ArrowApply (Transform n m s) where
+    app = Transform $ \s fl (Transform t, a) -> t s fl a
+
+instance Monad m => Applicative (Transform n m s i) where
+    pure = arr . const
+    liftA2 f x y = uncurry f <$> (x &&& y) -- g and f must have same input, since the applicative category is parameterized over input type
+
+instance Monad m => Monad (Transform n m s ()) where
+    Transform t >>= k = Transform $ \s fl i -> t s fl i >>= \a -> (runTrans $ k a) s fl ()
+
+-- Transform is not a Bifunctor because its input begets its output; thus we cannot generally map over the input and maintain transitivity. Only endomorphisms would be acceptable, but that's not unconstrained parametric polymorphism, so GHC doesn't allow it. However, you can map over the input of the string sending function.
+
+-- | @Transform@ can't be a @MonadTrans@ because it's of the wrong kind. So here's its implementation of @lift@
+transLift :: m b -> Transform n m s a b
+transLift m = Transform $ \_ _ _ -> m
+
+send :: NatTrans n m -> Transform n m s s ()
+send n = Transform $ \s _ -> n . s
+
+flush :: NatTrans n m -> Transform n m s a ()
+flush n = Transform $ \_ fl _ -> n fl
+
+sendAndFlush :: Applicative m => NatTrans n m -> Transform n m s s ()
+sendAndFlush n = Transform $ \s fl i -> (n . s) i *> n fl
+
+-- | Override any input passed to a transform, preserving send and flush
+withInput :: a -> Transform n m s a b -> Transform n m s i b
+withInput x (Transform t) = Transform $ \s fl _ -> t s fl x
+
+-- | Imagining @Transform@ as a record type, @strmap f t = "t {send = send t . f}"@
+strmap :: (s -> s') -> Transform n f s a b -> Transform n f s' a b
+strmap f (Transform t) = Transform $ \s fl -> t (s . f) fl
 
 -- | Output text to an IO 'Handle', as you would a @StreamingBody@.
-runTransformHandle :: MonadIO m => Handle -> Transform m Utf8Builder () -> m ()
+runTransformHandle :: MonadIO n => Handle -> Transform n m Utf8Builder a b -> a -> m b
 runTransformHandle h (Transform t) = t (hPutBuilder h . getUtf8Builder) (hFlush h)
 
--- | For pass to @responseStream@ in the @wai@ package
-toStreamingBody :: Transform IO Utf8Builder () -> (Builder -> IO ()) -> IO () -> IO ()
-toStreamingBody = getTrans . BiF.first getUtf8Builder
+toStreamingBodyUtf8 :: Transform IO IO Utf8Builder a () -> a -> (Builder -> IO ()) -> IO () -> IO ()
+toStreamingBodyUtf8 = toStreamingBody . strmap getUtf8Builder
 
--- | Create a transform that merely sends a value and *does not flush it*. This would be the implementation of @pure@ if @Transform@ were an @Applicative@, which it isn't because @liftA2@ cannot be defined (though I haven't proven this, and I'd like to identify exactly /why/ it cannot be done.)
-pureTrans :: Applicative f => s -> Transform f s ()
-pureTrans x = Transform $ \send _ -> send x
+-- having n ~ m ~ IO is fine; we still benefit from having both types because before converting to IO, m will be e.g. ExceptT e IO
+-- | Pass to @responseStream@ in the @wai@ package
+toStreamingBody :: Transform IO IO Builder a () -> a -> (Builder -> IO ()) -> IO () -> IO ()
+toStreamingBody t i = \s f -> (runTrans t) s f i
 
--- | Convenience functional made HTTP responses that may fail. Here's the definition of @someTrans@ from the error handling example in 'Transform''s documentation, in terms of @withError@ and 'handleExcept':
+-- Writer is fine if its strict, right?
+-- | Uses a @WriterT@ to accumulate stream (@tell@ as send, @pure ()@ as flush).
+runTransformPure :: (Monad n, Monoid s) => Transform (WriterT s n) m s a b -> a -> m b
+runTransformPure t = runTrans t tell (pure ())
+
+-- | Lifts a call to @handle@ to a @ChronicleT@. See example in 'withError' documentation.
+handleExcept :: (MonadUnliftIO m, Exception e, Semigroup l) => (e -> m l) -> m r -> ChronicleT l m r
+handleExcept h r = ChronicleT $ handle (fmap This . h) (fmap pure r)
+
+-- I wonder why this doesn't come already included in the @these@ package.
+-- | @ExceptT@ → @ChronicleT@ monomorphism
 --
--- @
--- someTrans = withError (status500,) (status200,)
---           $ display . commonmarkToHtml []
---          \<$\> handleExcept (\\(e :: IOException) -\> "Could not read markdown source file: " \<\> display e) (display \<$\> readFileUtf8 "thing.md")
--- @
-withError :: Applicative f
-          => (Transform f i () -> b) -- ^ on failed execution of transform
-          -> (Transform f i () -> b) -- ^ on successful execution of transform
-          -> ExceptT i f i -- route that supports failure
-          -> f b
-withError onBad onGood = fmap ((onBad ||| onGood) . both (\x -> Transform $ \send flush -> send x *> flush)) . runExceptT
-
--- | Lifts a call to @handle@ to @ExceptT@. See example in 'withError' documentation.
-handleExcept :: (MonadUnliftIO m, Exception e) => (e -> m a) -> m b -> ExceptT a m b
-handleExcept h r = ExceptT $ handle (fmap Left . h) (Right <$> r)
+-- * though @Last@ is not stictly needed to construct a @ChronicleT@, @ChronicleT@ is defined as an @Applicative@ only when parameterized over a @Semigroup@.
+-- * monic because it allows the terminal object of the monad to be a product rather than a mere coproduct. See 'memento' for its epic dual.
+liftExcept :: Functor m => NatTrans (ExceptT e m) (ChronicleT (Last e) m)
+liftExcept = ChronicleT . fmap (either This That) . runExceptT . withExceptT Last
 
 -- | Create a Transform from macros in a body of text. The macro format is QuasiQuotation-like: @[macroName|input|]@. This will pass @input@ to the @macroName@ macro, then replace the whole quasi-quote block with its output.
 --
@@ -117,40 +177,61 @@ handleExcept h r = ExceptT $ handle (fmap Left . h) (Right <$> r)
 -- === Example
 --
 -- @
--- let input :: Text
+-- type OurTransformer n = Transform n (ChronicleT [Text] n) Text Text ()
+--
+-- let nat :: (MonadTrans t, Monad m) => m a -> t m a
+--     nat = lift
+--
+--     send' :: (MonadTrans t, Monad n) => Transform n (t n) s s ()
+--     send' = send nat
+--
+--     input :: Text
 --     input = "just text [hi|this input will be ignored|] and [upper|this input will be uppercase'd|]"
 --
---     macroMap :: Applicative m =\> Map Text (Text -\> Transform m Utf8Builder ())
---     macroMap = [ ("hi", \\_ send _ -\> send "hi")
---                , ("upper", \\arg send flush -\> send (display $ T.toUpper arg) *\> flush)
+--     macroMap :: Monad n => Map Text (OurTransformer n)
+--     macroMap = [ ("hi", withInput "hi" send')
+--                , ("upper", T.toUpper ^>> send')
 --                ]
 --
---     onMissingMacro :: Monad m =\> Text -\> Text -\> Transform m Utf8Builder ()
---     onMissingMacro macroName remainder = \\send flush -\> send ("invalid macro: " \<\> display macroName) *\> flush *\> buildTransform onMissingMacro macroMap remainder send flush
+--     onMissingMacro :: Monad n => Text -> OurTransformer n
+--     onMissingMacro macroName = transLift (dictate [macroName]) *> macros nat onMissingMacro macroMap
 --
---     transform :: Monad m =\> Transform m Utf8Builder ()
---     transform = buildTransform onMissingMacro macroMap input
+--     transform :: Monad n => OurTransformer n
+--     transform = macros nat onMissingMacro macroMap
 -- @
-buildTransform :: forall m trans
-                . (Monad m, trans ~ Transform m Utf8Builder ())
-               => (Text -> Text -> trans) -- ^ how to handle macros not being found. Arguments are macro name, then text following macro clause
-               -> Map Text (Text -> trans) -- ^ macro identifiers and their corresponding functions to apply to their inputs
-               -> Text -- ^ input text
-               -> trans
-buildTransform handleNoMacro !m = go
+--
+-- >>> runWriter . runChronicleT $ runTransformPure transform input
+-- (That (),"just text hi and THIS INPUT WILL BE UPPERCASE'D")
+--
+-- If we change the "hi" macro in input to "ho", which is not in the macro map, then we get
+--
+-- @(These ["ho"] (),"just text  and THIS INPUT WILL BE UPPERCASE'D")@
+--
+-- Note that @onMissingMacro@ is recursively defined /and/ calls @macros@. This is an important pattern for @macros@, since it enables consuming the text after the invalid macro. If I'd defined onMissingMacro as @transLift . dictate . (:[])@, then, because /ho/ isn't a valid macro, I'd get @(These ["ho"] (),"just text ")@.
+--
+-- Also instead, I could run @transform@ as a HTTP response stream, here discarding effects collected from @ChronicleT@, and creating a WAI @Response@:
+--
+-- @responseStream ok200 [] (toStreamingBodyUtf8 . mmap (void . runChronicleT) . strmap display) transform input@
+--
+-- I generally prefer @ChronicleT@ over @ExceptT@ or @WriterT@, by the way, since it can do either. I'll assume, however, that @ChronicleT@ acts non-strictly; this it should be used for logging exceptional behavior, since such logging is expected to be little.
+macros :: forall n m trans
+        . (Monad m, trans ~ Transform n m Text Text ())
+       => NatTrans n m
+       -> (Text -> trans) -- ^ how to handle macros not being found, parameterized by the transform name that wasn't present in the map. The transform will run over the remaining input.
+       -> Map Text trans -- ^ map of transforms by name
+       -> trans
+macros n handleNoMacro !m = go
   where
-    go :: Text -> trans
-    go !s = Transform $ \send flush -> case parse parser s of
-        Partial _ -> -- the input string ended in the middle of a macro clause; TODO: send warning about it
-            send (display s)
-        Done remainder (!before, mm) -> do
-            send (display before)
-            case mm of
-                Nothing -> getTrans (go remainder) send flush
-                Just (!macro, arg) -> case M.lookup macro m of
-                    Nothing -> getTrans (handleNoMacro macro remainder) send flush
-                    Just f -> getTrans (f arg) send flush *> getTrans (go remainder) send flush
-        _ -> error "impossible parse fail in buildTransform"
+    go :: trans
+    go = proc str -> do
+        parsed <- arr (parse parser) -< str
+        let y = case parsed of
+                Partial _ -> send n
+                Done remainder (!before, mm) ->
+                    withInput before (send n)
+                    *> withInput remainder (maybeC mm go $ \(!macro, arg) -> maybeC (M.lookup macro m) (handleNoMacro macro) $ \f -> withInput arg f *> go)
+                _ -> error "impossible parse fail in macros"
+        y -<< str
       where
         parser :: Parser (Text, Maybe (Text, Text))
         parser = escape '[' $ do
@@ -159,6 +240,7 @@ buildTransform handleNoMacro !m = go
             input <- manyTill' anyChar "|]" -- surprised there's no provided more efficient Text-specific version
             pure (name, T.pack input)
 
+-- consider proofreading extension that, if a transform detects a syntax error, suggests a transform that'd fix it; all fixes are then applied at the end of the proofreading session, or incrementally
 {- | Create links to footnotes for of the form:
 --
 -- @
@@ -179,15 +261,15 @@ buildTransform handleNoMacro !m = go
 -- * the footnotes section is defined as the section after the document's final "---"
 -- * the footnotes do not need to start at 1. Any parenthesis-with-number ocurring before the footnotes section is looked-up in the footnotes section; thus having out of order or non-consecutive footnotes is fine.
 -- * never should a footnote occur more than once in either the body or footnote lookup section. You'll get odd results otherwise (but it won't break anything.)
-footnotes :: Text -> Transform m s
-footnotes s = \send flush -> case parse parser s of
+footnotes :: Transform n m s Text ()
+footnotes = \s fl -> case parse parser str of
     Fail before context errMsg ->
     Partial k ->
     Done remainder (before, mns) -> do
-        send (display before)
-        flush
+        s (display before)
+        fl
         case mns of
-            Nothing ->
+            Nothing -> -- 続く: write footnotes, and apply it using comonads/functors, which are easy to define assuming that I'm hard-coding a structure (which I can afford to do for now.)
             Just ns ->
   where
     parser = escape '(' $ do
@@ -207,7 +289,8 @@ escape leading p = do
     someChar <- anyChar
     if | someChar == '\\' -> next *> pure (before, Nothing)
        | someChar == leading -> (before,) . Just <$> p
-       | True -> error "Impossible character encountered in escape"
+       | otherwise -> error "Impossible character encountered in escape"
 
 -- | Skip a character
+next :: Parser ()
 next = skip (const True)

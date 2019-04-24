@@ -1,5 +1,3 @@
-{-# OPTIONS_GHC -fno-warn-orphans #-}
-
 -- | Defines 'HeadModT', which wraps Lucid's @Html a@ and an automorphism on \<head\>. Allows defining html fragments in the same place as the resources that it requires; never worry about \<head\> again! More generally, useful for importing a bunch of dependencies non-redundantly and without conflict. Example:
 --
 -- @
@@ -73,8 +71,6 @@ import qualified Data.Set as S
 -- miscellaneous packages
 import qualified Data.Text as T -- text
 
-deriving instance Ord Attribute
-
 -- | Abstract representation of an Html element that belongs in <head>. Usually I expect you'll use @Element Text@; however, I'm leaving it polymorphic so that you can use any @ToHtml a => Element a@, as that's the most general form of element that works with @toDoc@.
 --
 -- @Text@ should work fine considering that, as far as I know, at least, there are no children of <head> that have any more children than merely a single text node.
@@ -101,6 +97,8 @@ instance ToHtml a => ToHtml (Element a) where
         with (makeElement name (maybe mempty toHtml mcontent)) attrs
     toHtmlRaw (Element {name, mcontent, attrs}) =
         with (makeElement name (maybe mempty toHtmlRaw mcontent)) attrs
+
+deriving instance Ord Attribute
 
 -- | We see the <head> element not as @Html ()@, but as @Set (Html ())@ because
 --

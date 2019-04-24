@@ -1,5 +1,5 @@
 name:                data-manip
-version:             0.1.0.0
+version:             0.2.0.0
 github:              "nick-chandoke/data-manip"
 license:             BSD3
 author:              "Nicholas Chandoke"
@@ -21,6 +21,7 @@ dependencies:
 - rio
 - text
 - transformers
+- these
 
 library:
   source-dirs: src
